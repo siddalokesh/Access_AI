@@ -67,9 +67,6 @@ MAX_HTML_BYTES = 500_000
 
 PAGE_LOAD_TIMEOUT_MS = 30_000
 
-# Maximum PDF upload size = 20 MB
-MAX_PDF_BYTES = 20 * 1024 * 1024
-
 
 # ============================================================
 # GEMINI API KEY
@@ -92,7 +89,6 @@ You audit a webpage using ALL available browser and visual evidence:
 3. Computed styles and rendered geometry/bounding boxes.
 4. A live Chromium screenshot of the rendered page.
 5. The original server HTTP response source.
-6. A user-supplied PDF screenshot/document.
 
 Use the sources together. Prefer live rendered evidence (DOM, accessibility
 tree, computed styles/geometry, and screenshot) when evaluating the current
@@ -112,7 +108,7 @@ Use the rendered HTML to identify:
 - DOM structure
 - WCAG implementation issues
 
-Use the live Chromium screenshot and PDF visual representations to identify visual issues such as:
+Use the live Chromium screenshot to identify visual issues such as:
 
 - Color contrast
 - Text visibility
@@ -132,7 +128,7 @@ IMPORTANT:
 Do not invent accessibility issues.
 
 Only report issues that are reasonably supported by the
-rendered HTML or the supplied PDF.
+available browser evidence.
 
 Audit against WCAG 2.1 and WCAG 2.2.
 
@@ -313,7 +309,7 @@ def render_and_run_script_checks(url: str):
 # GEMINI ACCESSIBILITY AUDIT
 # ============================================================
 
-def run_accessibility_audit(html_source: str, original_source: str, accessibility_tree: str, element_data: list, screenshot_bytes: bytes, pdf_bytes: bytes) -> dict:
+def run_accessibility_audit(html_source: str, original_source: str, accessibility_tree: str, element_data: list, screenshot_bytes: bytes) -> dict:
 
     if not API_KEY:
         raise RuntimeError(
@@ -343,8 +339,6 @@ def run_accessibility_audit(html_source: str, original_source: str, accessibilit
         "Use the attached PNG image to evaluate visual appearance, layout, overlap, text visibility, visual focus indicators, images of text, and other issues that require visual context.\n\n"
         "SOURCE 5 - ORIGINAL SERVER SOURCE:\n"
         "```html\n" + original_source + "\n```\n\n"
-        "SOURCE 6 - USER-SUPPLIED PDF SCREENSHOT/DOCUMENT:\n"
-        "Use the attached PDF as additional visual evidence. If it conflicts with the live Chromium screenshot, prefer the live Chromium screenshot for the current rendered page and use the PDF only as supporting evidence.\n\n"
         "Important evidence rules:\n"
         "- Rendered DOM describes the current post-JavaScript page.\n"
         "- Accessibility tree describes the browser accessibility representation.\n"
@@ -360,7 +354,6 @@ def run_accessibility_audit(html_source: str, original_source: str, accessibilit
         contents=[
             types.Part.from_text(text=prompt),
             types.Part.from_bytes(data=screenshot_bytes, mime_type="image/png"),
-            types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"),
         ],
         config=types.GenerateContentConfig(
             system_instruction=SYSTEM_INSTRUCTION,
@@ -432,53 +425,33 @@ def merge_findings(ai_findings, script_findings):
 
 app = Flask(__name__)
 
-app.config["MAX_CONTENT_LENGTH"] = MAX_PDF_BYTES + (1 * 1024 * 1024)
-
 
 @app.route("/")
 def index():
     return render_template_string(INDEX_HTML)
 
 
+
 @app.route("/api/audit", methods=["POST"])
 def api_audit():
 
     url = (request.form.get("url") or "").strip()
-    pdf_file = request.files.get("screenshot")
 
     if not url:
         return jsonify({"ok": False, "error": "Please enter a URL."}), 400
 
     if not (url.startswith("http://") or url.startswith("https://")):
-        return jsonify({"ok": False, "error": "URL must start with http:// or https://"}), 400
-
-    if not pdf_file:
-        return jsonify({"ok": False, "error": "Please upload a PDF screenshot."}), 400
-
-    filename = (pdf_file.filename or "").lower()
-    if not filename.endswith(".pdf"):
-        return jsonify({"ok": False, "error": "Only PDF files are allowed."}), 400
-
-    allowed_mime_types = {"application/pdf", "application/x-pdf"}
-    if pdf_file.mimetype not in allowed_mime_types:
-        return jsonify({"ok": False, "error": "Uploaded file must be a PDF."}), 400
+        return jsonify({
+            "ok": False,
+            "error": "URL must start with http:// or https://"
+        }), 400
 
     try:
-        pdf_bytes = pdf_file.read()
-
-        if not pdf_bytes:
-            return jsonify({"ok": False, "error": "The uploaded PDF is empty."}), 400
-
-        if len(pdf_bytes) > MAX_PDF_BYTES:
-            return jsonify({"ok": False, "error": "PDF is too large. Maximum size is 20 MB."}), 400
-
-        if not pdf_bytes.startswith(b"%PDF"):
-            return jsonify({"ok": False, "error": "The uploaded file does not appear to be a valid PDF."}), 400
-
         # ----------------------------------------------------
-        # Render webpage ONCE + run app2.py script checks on it
+        # Render webpage ONCE + run app2.py script checks
         # ----------------------------------------------------
         print("\n[INFO] Rendering URL:", url)
+
         (
             html_source,
             original_source,
@@ -487,26 +460,34 @@ def api_audit():
             screenshot_bytes,
             script_findings,
         ) = render_and_run_script_checks(url)
+
         print("[INFO] Webpage rendered and all browser evidence collected successfully.")
 
         # ----------------------------------------------------
-        # Gemini audit (DOM + ARIA + styles/geometry + screenshot + source + PDF)
+        # Gemini audit
         # ----------------------------------------------------
-        print("[INFO] Sending rendered DOM + accessibility tree + styles/geometry + screenshot + source + PDF to Gemini...")
+        print(
+            "[INFO] Sending rendered DOM + accessibility tree + "
+            "styles/geometry + screenshot + source to Gemini..."
+        )
+
         audit_result = run_accessibility_audit(
             html_source=html_source,
             original_source=original_source,
             accessibility_tree=accessibility_tree,
             element_data=element_data,
             screenshot_bytes=screenshot_bytes,
-            pdf_bytes=pdf_bytes,
         )
+
         print("[INFO] Gemini accessibility audit completed.")
 
         # ----------------------------------------------------
         # Merge AI + Script results, dedupe
         # ----------------------------------------------------
-        combined_findings = merge_findings(audit_result.get("findings", []), script_findings)
+        combined_findings = merge_findings(
+            audit_result.get("findings", []),
+            script_findings
+        )
 
     except Exception as e:
         print("[ERROR]", str(e))
@@ -518,9 +499,18 @@ def api_audit():
         "summary": audit_result.get("summary", ""),
         "findings": combined_findings,
         "counts": {
-            "ai_only": sum(1 for f in combined_findings if f["source"] == "AI"),
-            "script_only": sum(1 for f in combined_findings if f["source"] == "Script"),
-            "both": sum(1 for f in combined_findings if f["source"] not in ("AI", "Script")),
+            "ai_only": sum(
+                1 for f in combined_findings
+                if f["source"] == "AI"
+            ),
+            "script_only": sum(
+                1 for f in combined_findings
+                if f["source"] == "Script"
+            ),
+            "both": sum(
+                1 for f in combined_findings
+                if f["source"] not in ("AI", "Script")
+            ),
         },
         "coverage": app2.coverage_report(),
     })
@@ -583,6 +573,105 @@ h1 { margin: 0 0 4px 0; font-size: 24px; }
 
 .input-row { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; }
 
+/* Accessibility Filter Panel */
+.checkbox-filter-panel {
+    margin-top: 18px;
+    padding: 16px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+}
+
+.checkbox-filter-heading {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text);
+    margin-bottom: 14px;
+}
+
+/* Group layout */
+.checkbox-groups {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+}
+
+/* Individual groups */
+.checkbox-group {
+    padding: 14px 16px;
+    background: #0b0d11;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+}
+
+/* Conformance Level takes the complete first row */
+.checkbox-group.conformance-group {
+    grid-column: 1 / -1;
+}
+
+/* Group titles */
+.checkbox-group-title {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text);
+    margin-bottom: 11px;
+    letter-spacing: 0.2px;
+}
+
+/* Checkbox containers */
+.checkbox-options {
+    display: flex;
+    gap: 24px;
+}
+
+/* Principles and Check Type - vertical layout */
+.checkbox-group.vertical .checkbox-options {
+    flex-direction: column;
+    gap: 9px;
+}
+
+/* Checkbox item */
+.checkbox-option {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    color: var(--muted);
+    cursor: pointer;
+    user-select: none;
+}
+
+/* Keep text readable on hover */
+.checkbox-option:hover {
+    color: var(--text);
+}
+
+/* Checkbox */
+.checkbox-option input[type="checkbox"] {
+    width: 15px;
+    height: 15px;
+    margin: 0;
+    accent-color: #2563eb;
+    cursor: pointer;
+}
+
+/* Keyboard focus */
+.checkbox-option input[type="checkbox"]:focus-visible {
+    outline: 2px solid #2563eb;
+    outline-offset: 2px;
+}
+
+/* Responsive */
+@media (max-width: 700px) {
+    .checkbox-groups {
+        grid-template-columns: 1fr;
+    }
+
+    .checkbox-group.conformance-group {
+        grid-column: auto;
+    }
+}
+
 .url-container { flex: 1; min-width: 300px; }
 
 .url-input {
@@ -604,9 +693,6 @@ h1 { margin: 0 0 4px 0; font-size: 24px; }
 }
 .run-button:hover { background: #1d4ed8; }
 .run-button:disabled { background: #374151; cursor: not-allowed; }
-
-.pdf-info { display: none; margin-top: 12px; color: var(--muted); font-size: 12px; }
-.pdf-info strong { color: var(--text); }
 
 .status { font-size: 13px; margin-bottom: 20px; min-height: 18px; }
 .status.error { color: #fca5a5; }
@@ -728,19 +814,112 @@ merged below.
 <input type="text" id="urlInput" class="url-input" placeholder="https://example.com"/>
 </div>
 
-<div class="pdf-container">
-<label class="input-label" for="screenshotInput">Screenshot PDF</label>
-<div class="pdf-input-wrapper">
-<input type="file" id="screenshotInput" class="pdf-input" accept="application/pdf,.pdf"/>
-</div>
-</div>
-
 <button id="runBtn" class="run-button" onclick="runAudit()">Run Audit</button>
 
 </div>
 
-<div id="pdfInfo" class="pdf-info">
-Selected PDF: <strong id="pdfName"></strong> &nbsp; | &nbsp; Size: <strong id="pdfSize"></strong>
+<div class="checkbox-filter-panel">
+
+    <div class="checkbox-filter-heading">
+        Accessibility Filters
+    </div>
+
+    <div class="checkbox-groups">
+
+        <!-- Conformance Level - Full Width -->
+        <div class="checkbox-group conformance-group">
+
+            <div class="checkbox-group-title">
+                Conformance Level
+            </div>
+
+            <div class="checkbox-options">
+
+                <label class="checkbox-option">
+                    <input type="checkbox" checked>
+                    <span>A</span>
+                </label>
+
+                <label class="checkbox-option">
+                    <input type="checkbox" checked>
+                    <span>AA</span>
+                </label>
+
+                <label class="checkbox-option">
+                    <input type="checkbox" checked>
+                    <span>AAA</span>
+                </label>
+
+            </div>
+        </div>
+
+
+        <!-- Principles -->
+        <div class="checkbox-group vertical">
+
+            <div class="checkbox-group-title">
+                Principles
+            </div>
+
+            <div class="checkbox-options">
+
+                <label class="checkbox-option">
+                    <input type="checkbox" checked>
+                    <span>Perceivable</span>
+                </label>
+
+                <label class="checkbox-option">
+                    <input type="checkbox" checked>
+                    <span>Operable</span>
+                </label>
+
+                <label class="checkbox-option">
+                    <input type="checkbox" checked>
+                    <span>Understandable</span>
+                </label>
+
+                <label class="checkbox-option">
+                    <input type="checkbox" checked>
+                    <span>Robust</span>
+                </label>
+
+            </div>
+        </div>
+
+
+        <!-- Check Type -->
+        <div class="checkbox-group vertical">
+
+            <div class="checkbox-group-title">
+                Check Type
+            </div>
+
+            <div class="checkbox-options">
+
+                <label class="checkbox-option">
+                    <input type="checkbox" checked>
+                    <span>Interaction</span>
+                </label>
+
+                <label class="checkbox-option">
+                    <input type="checkbox" checked>
+                    <span>LLM</span>
+                </label>
+
+                <label class="checkbox-option">
+                    <input type="checkbox" checked>
+                    <span>Rule</span>
+                </label>
+
+                <label class="checkbox-option">
+                    <input type="checkbox" checked>
+                    <span>Rule+LLM</span>
+                </label>
+
+            </div>
+        </div>
+
+    </div>
 </div>
 
 </div>
@@ -814,17 +993,6 @@ function escapeHtml(s) {
     return div.innerHTML;
 }
 
-document.getElementById('screenshotInput').addEventListener('change', function () {
-    const file = this.files[0];
-    const pdfInfo = document.getElementById('pdfInfo');
-    const pdfName = document.getElementById('pdfName');
-    const pdfSize = document.getElementById('pdfSize');
-    if (!file) { pdfInfo.style.display = 'none'; return; }
-    pdfName.textContent = file.name;
-    pdfSize.textContent = formatFileSize(file.size);
-    pdfInfo.style.display = 'block';
-});
-
 function formatFileSize(bytes) {
     if (bytes < 1024) return bytes + ' B';
     if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
@@ -864,25 +1032,12 @@ function applySourceFilter(source) {
 
 async function runAudit() {
     const url = document.getElementById('urlInput').value.trim();
-    const screenshotInput = document.getElementById('screenshotInput');
-    const pdfFile = screenshotInput.files[0];
     const statusEl = document.getElementById('status');
     const runBtn = document.getElementById('runBtn');
 
     if (!url) { statusEl.className = 'status error'; statusEl.textContent = 'Please enter a URL.'; return; }
     if (!url.startsWith('http://') && !url.startsWith('https://')) {
         statusEl.className = 'status error'; statusEl.textContent = 'URL must start with http:// or https://'; return;
-    }
-    if (!pdfFile) { statusEl.className = 'status error'; statusEl.textContent = 'Please upload a PDF screenshot.'; return; }
-    if (!pdfFile.name.toLowerCase().endsWith('.pdf')) {
-        statusEl.className = 'status error'; statusEl.textContent = 'Only PDF files are allowed.'; return;
-    }
-    if (pdfFile.type && pdfFile.type !== 'application/pdf') {
-        statusEl.className = 'status error'; statusEl.textContent = 'The uploaded file must be a PDF.'; return;
-    }
-    const maxSize = 20 * 1024 * 1024;
-    if (pdfFile.size > maxSize) {
-        statusEl.className = 'status error'; statusEl.textContent = 'PDF is too large. Maximum size is 20 MB.'; return;
     }
 
     runBtn.disabled = true;
@@ -892,7 +1047,6 @@ async function runAudit() {
     try {
         const formData = new FormData();
         formData.append('url', url);
-        formData.append('screenshot', pdfFile);
 
         const response = await fetch('/api/audit', { method: 'POST', body: formData });
         const data = await response.json();
